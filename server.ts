@@ -76,6 +76,13 @@ const SYSTEM_PROMPT = `You are Speakeasy Scout, the world's most knowledgeable v
    - Do NOT make up URLs, image URLs, or prices
    - Do NOT mix images between listings
 
+6. **STRICT PRICE VERIFICATION**:
+   - ONLY include listings that have a verified price within the user's budget
+   - If user says "under $20" - do NOT include ANY listing over $20
+   - If a listing shows price like "$650" and budget is $20 - SKIP IT COMPLETELY
+   - Double-check each price before including a listing
+   - If you can't verify the price is within budget, don't include the listing
+
 5. **URLs Must Be ACTUAL Listing Pages**:
    VALID: https://www.ebay.com/itm/123456789012 (actual item page)
    VALID: https://www.etsy.com/listing/1234567890/vintage-lamp
@@ -159,8 +166,11 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
     searchQuery += ` ${options.location}`;
   }
 
-  // Add price constraints
-  if (options.minPrice && options.maxPrice) {
+  // Add price constraints - be very explicit for low budgets
+  if (options.maxPrice && options.maxPrice <= 50) {
+    // For low budgets, be very explicit about price
+    searchQuery += ` under $${options.maxPrice} cheap budget affordable`;
+  } else if (options.minPrice && options.maxPrice) {
     searchQuery += ` $${options.minPrice}-$${options.maxPrice}`;
   } else if (options.minPrice) {
     searchQuery += ` over $${options.minPrice}`;
@@ -481,16 +491,33 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
           }
         }
 
-        // Filter by price if max price is set
-        if (priceFromSnippet && options.maxPrice) {
-          const priceNum = parseFloat(priceFromSnippet.replace(/[$,]/g, ''));
-          if (priceNum > options.maxPrice) {
-            console.log(`[Scout] Skipping listing over max price: ${priceFromSnippet} > $${options.maxPrice}`);
-            return; // Skip this listing
+        // STRICT PRICE ENFORCEMENT
+        // If max price is set, we MUST verify the listing is within budget
+        if (options.maxPrice) {
+          if (!priceFromSnippet) {
+            // Can't verify price - skip unless it's a very low max (under $50) where we're lenient
+            if (options.maxPrice < 50) {
+              console.log(`[Scout] Skipping listing with unknown price (strict mode for budget under $50)`);
+              return;
+            }
+            // For higher budgets, mark as "price unknown" but include
+            priceFromSnippet = 'Price unknown';
+          } else {
+            const priceNum = parseFloat(priceFromSnippet.replace(/[$,]/g, ''));
+            if (priceNum > options.maxPrice) {
+              console.log(`[Scout] REJECTED: ${priceFromSnippet} exceeds max $${options.maxPrice} - "${result.title?.substring(0, 40)}"`);
+              return; // Skip this listing
+            }
+            // Also reject if price is suspiciously high relative to budget (likely wrong item)
+            if (priceNum > options.maxPrice * 3) {
+              console.log(`[Scout] REJECTED: ${priceFromSnippet} way over budget - "${result.title?.substring(0, 40)}"`);
+              return;
+            }
           }
         }
+
         // Filter by min price if set
-        if (priceFromSnippet && options.minPrice) {
+        if (priceFromSnippet && priceFromSnippet !== 'Price unknown' && options.minPrice) {
           const priceNum = parseFloat(priceFromSnippet.replace(/[$,]/g, ''));
           if (priceNum < options.minPrice) {
             console.log(`[Scout] Skipping listing under min price: ${priceFromSnippet} < $${options.minPrice}`);
@@ -515,10 +542,16 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
 
       console.log(`[Scout] Formatted ${listingsKept}/${data.results.length} listings (${data.results.length - listingsKept} filtered by price) with ${imagesFound} verified images`);
 
-      formattedResults += `\n*** CRITICAL INSTRUCTIONS:
+      // Add budget reminder if price limits are set
+      const budgetInfo = options.maxPrice
+        ? `\n*** BUDGET LIMIT: $${options.maxPrice} MAX ***\nDo NOT include any listing with price over $${options.maxPrice}. Verify each price before including.\n`
+        : '';
+
+      formattedResults += `${budgetInfo}
+*** CRITICAL INSTRUCTIONS:
 1. ONLY use the DIRECT_LINK exactly as shown - these are verified listing URLs
 2. ONLY include images if IMAGE_URLS is provided - do NOT invent or guess image URLs
-3. Use the exact PRICE shown for each listing
+3. Use the exact PRICE shown for each listing - VERIFY it's within budget
 4. IMAGE_URLS may contain multiple URLs separated by commas - include ALL of them
 5. Format each item EXACTLY as:
    ### [Title](DIRECT_LINK)
@@ -527,6 +560,7 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
    *Brief description*
 6. If no IMAGE_URLS is provided for a listing, skip the IMAGE_URLS line entirely
 7. CRITICAL: Copy IMAGE_URLS exactly as provided - do not rename to IMAGES or any other format
+8. PRICE CHECK: Before including ANY listing, verify its price is within budget. Skip if over budget.
 ***`;
       return formattedResults;
     }
