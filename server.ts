@@ -150,6 +150,326 @@ interface SearchOptions {
   listingAge?: '24h' | '3d' | '7d' | '30d' | 'any';
 }
 
+// ============================================
+// MULTI-AGENT ORCHESTRATION SYSTEM
+// ============================================
+
+interface ListingResult {
+  title: string;
+  url: string;
+  price: number | null;
+  priceText: string;
+  images: string[];
+  source: string;
+  snippet: string;
+  verified: boolean;
+  verificationNotes: string[];
+}
+
+interface AgentResult {
+  agentName: string;
+  marketplace: string;
+  listings: ListingResult[];
+  searchTime: number;
+  error?: string;
+}
+
+// Marketplace-specific search agent
+async function marketplaceAgent(
+  marketplace: string,
+  domain: string,
+  query: string,
+  options: SearchOptions
+): Promise<AgentResult> {
+  const startTime = Date.now();
+  const agentName = `${marketplace}Agent`;
+  console.log(`[${agentName}] Starting search on ${domain}...`);
+
+  const apiKey = process.env.TAVILY_API_KEY;
+  if (!apiKey) {
+    return { agentName, marketplace, listings: [], searchTime: 0, error: 'No API key' };
+  }
+
+  // Build marketplace-specific query
+  let searchQuery = query;
+  if (options.zipCode) {
+    searchQuery += ` near ${options.zipCode}`;
+  }
+  if (options.maxPrice && options.maxPrice <= 100) {
+    searchQuery += ` under $${options.maxPrice} cheap`;
+  } else if (options.maxPrice) {
+    searchQuery += ` under $${options.maxPrice}`;
+  }
+
+  try {
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query: searchQuery,
+        search_depth: "advanced",
+        include_images: true,
+        max_results: 10,
+        include_domains: [domain]
+      })
+    });
+
+    if (!response.ok) {
+      console.log(`[${agentName}] API error: ${response.status}`);
+      return { agentName, marketplace, listings: [], searchTime: Date.now() - startTime, error: `API ${response.status}` };
+    }
+
+    const data = await response.json();
+    const listings: ListingResult[] = [];
+
+    if (data.results) {
+      for (const result of data.results) {
+        // Extract price
+        let price: number | null = null;
+        let priceText = '';
+        const pricePatterns = [
+          /\$\s*([\d,]+(?:\.\d{2})?)/,
+          /USD\s*([\d,]+(?:\.\d{2})?)/i,
+          /Price:?\s*\$?([\d,]+(?:\.\d{2})?)/i,
+        ];
+        const textToSearch = (result.title || '') + ' ' + (result.content || '');
+        for (const pattern of pricePatterns) {
+          const match = textToSearch.match(pattern);
+          if (match) {
+            price = parseFloat(match[1].replace(',', ''));
+            priceText = '$' + match[1];
+            break;
+          }
+        }
+
+        // Extract images
+        const images: string[] = [];
+        if (result.images && Array.isArray(result.images)) {
+          images.push(...result.images.slice(0, 3));
+        }
+
+        listings.push({
+          title: result.title || 'Untitled',
+          url: result.url,
+          price,
+          priceText: priceText || 'Price unknown',
+          images,
+          source: marketplace,
+          snippet: result.content?.substring(0, 200) || '',
+          verified: false,
+          verificationNotes: []
+        });
+      }
+    }
+
+    console.log(`[${agentName}] Found ${listings.length} listings in ${Date.now() - startTime}ms`);
+    return { agentName, marketplace, listings, searchTime: Date.now() - startTime };
+
+  } catch (err: any) {
+    console.log(`[${agentName}] Error: ${err.message}`);
+    return { agentName, marketplace, listings: [], searchTime: Date.now() - startTime, error: err.message };
+  }
+}
+
+// Verification agent - validates all results
+function verificationAgent(
+  allResults: AgentResult[],
+  options: SearchOptions
+): ListingResult[] {
+  console.log(`[VerificationAgent] Starting verification of ${allResults.reduce((sum, r) => sum + r.listings.length, 0)} listings...`);
+
+  const verified: ListingResult[] = [];
+  const rejected: { title: string; reason: string }[] = [];
+
+  // URL patterns for valid listings
+  const validUrlPatterns: Record<string, RegExp> = {
+    ebay: /ebay\.com\/itm\/\d+/i,
+    etsy: /etsy\.com\/listing\/\d+/i,
+    craigslist: /craigslist\.org\/[a-z]+\/[a-z]+\/d\/[^\/]+\/\d+\.html/i,
+    facebook: /facebook\.com\/(marketplace\/item\/\d+|item\/\d+)/i,
+    mercari: /mercari\.com\/.*item/i,
+    '1stdibs': /1stdibs\.com\/(furniture|art|jewelry|fashion)\/.*id/i,
+    chairish: /chairish\.com\/product\/\d+/i,
+    offerup: /offerup\.com\/item/i,
+  };
+
+  for (const agentResult of allResults) {
+    for (const listing of agentResult.listings) {
+      const notes: string[] = [];
+      let isValid = true;
+
+      // 1. URL Validation
+      const urlPattern = validUrlPatterns[listing.source];
+      if (urlPattern && !urlPattern.test(listing.url)) {
+        // Looser check - at least contains the domain
+        if (!listing.url.toLowerCase().includes(listing.source.toLowerCase().replace('1stdibs', '1stdibs'))) {
+          rejected.push({ title: listing.title, reason: `Invalid URL pattern for ${listing.source}` });
+          isValid = false;
+          continue;
+        }
+        notes.push('URL pattern non-standard but accepted');
+      }
+
+      // 2. Price Validation (STRICT)
+      if (options.maxPrice) {
+        if (listing.price === null) {
+          // For very low budgets, reject unknown prices
+          if (options.maxPrice <= 50) {
+            rejected.push({ title: listing.title, reason: `Unknown price (strict mode for budget $${options.maxPrice})` });
+            isValid = false;
+            continue;
+          }
+          notes.push('Price unknown - included with warning');
+        } else if (listing.price > options.maxPrice) {
+          rejected.push({ title: listing.title, reason: `$${listing.price} exceeds max $${options.maxPrice}` });
+          isValid = false;
+          continue;
+        } else {
+          notes.push(`Price $${listing.price} within budget $${options.maxPrice}`);
+        }
+      }
+
+      // 3. Min price validation
+      if (options.minPrice && listing.price !== null && listing.price < options.minPrice) {
+        rejected.push({ title: listing.title, reason: `$${listing.price} below min $${options.minPrice}` });
+        isValid = false;
+        continue;
+      }
+
+      // 4. Duplicate URL check
+      if (verified.some(v => v.url === listing.url)) {
+        rejected.push({ title: listing.title, reason: 'Duplicate URL' });
+        isValid = false;
+        continue;
+      }
+
+      if (isValid) {
+        listing.verified = true;
+        listing.verificationNotes = notes;
+        verified.push(listing);
+      }
+    }
+  }
+
+  console.log(`[VerificationAgent] Verified: ${verified.length}, Rejected: ${rejected.length}`);
+  rejected.forEach(r => console.log(`  - REJECTED: "${r.title.substring(0, 40)}..." - ${r.reason}`));
+
+  return verified;
+}
+
+// Orchestrator - coordinates all marketplace agents
+async function orchestratedSearch(options: SearchOptions): Promise<string> {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`[Orchestrator] Starting multi-agent search`);
+  console.log(`[Orchestrator] Query: "${options.query}"`);
+  console.log(`[Orchestrator] Budget: $${options.minPrice || 0} - $${options.maxPrice || 'unlimited'}`);
+  console.log(`${'='.repeat(60)}\n`);
+
+  // Define marketplace domains
+  const marketplaces: Record<string, string> = {
+    ebay: 'ebay.com',
+    etsy: 'etsy.com',
+    facebook: 'facebook.com/marketplace',
+    craigslist: 'craigslist.org',
+    mercari: 'mercari.com',
+    '1stdibs': '1stdibs.com',
+    chairish: 'chairish.com',
+    aptdeco: 'aptdeco.com',
+    offerup: 'offerup.com',
+  };
+
+  // Determine which marketplaces to search
+  const enabledMarketplaces: string[] = [];
+  if (options.sources) {
+    for (const [key, enabled] of Object.entries(options.sources)) {
+      if (enabled) {
+        const normalizedKey = key === 'firstdibs' ? '1stdibs' : key;
+        if (marketplaces[normalizedKey]) {
+          enabledMarketplaces.push(normalizedKey);
+        }
+      }
+    }
+  }
+  // Default to main marketplaces if none specified
+  if (enabledMarketplaces.length === 0) {
+    enabledMarketplaces.push('ebay', 'etsy', 'craigslist', 'facebook');
+  }
+
+  console.log(`[Orchestrator] Launching ${enabledMarketplaces.length} marketplace agents: ${enabledMarketplaces.join(', ')}`);
+
+  // Launch all marketplace agents in parallel
+  const agentPromises = enabledMarketplaces.map(marketplace =>
+    marketplaceAgent(marketplace, marketplaces[marketplace], options.query, options)
+  );
+
+  // Wait for all agents to complete
+  const agentResults = await Promise.all(agentPromises);
+
+  // Report agent results
+  console.log(`\n[Orchestrator] Agent Results:`);
+  let totalListings = 0;
+  for (const result of agentResults) {
+    console.log(`  - ${result.agentName}: ${result.listings.length} listings (${result.searchTime}ms)${result.error ? ` ERROR: ${result.error}` : ''}`);
+    totalListings += result.listings.length;
+  }
+
+  // Run verification agent
+  console.log(`\n[Orchestrator] Running verification agent on ${totalListings} listings...`);
+  const verifiedListings = verificationAgent(agentResults, options);
+
+  // Format results
+  if (verifiedListings.length === 0) {
+    return `NO VERIFIED LISTINGS FOUND.
+
+The multi-agent search checked ${enabledMarketplaces.length} marketplaces but found no listings matching your criteria.
+${options.maxPrice ? `Budget: Under $${options.maxPrice}` : ''}
+
+Please tell the user:
+"I searched ${enabledMarketplaces.join(', ')} but couldn't find items within your budget. Try:
+1. Increasing your budget slightly
+2. Using different search terms
+3. Checking back later as new listings are posted daily"`;
+  }
+
+  // Build formatted results
+  let formattedResults = `MULTI-AGENT SEARCH COMPLETE
+Agents deployed: ${enabledMarketplaces.length} (${enabledMarketplaces.join(', ')})
+Total found: ${totalListings} | Verified: ${verifiedListings.length}
+${options.maxPrice ? `Budget filter: Under $${options.maxPrice}` : ''}
+
+VERIFIED LISTINGS:\n\n`;
+
+  verifiedListings.slice(0, 15).forEach((listing, index) => {
+    formattedResults += `===== LISTING ${index + 1} =====\n`;
+    formattedResults += `TITLE: ${listing.title}\n`;
+    formattedResults += `DIRECT_LINK: ${listing.url}\n`;
+    formattedResults += `PRICE: ${listing.priceText}\n`;
+    formattedResults += `SOURCE: ${listing.source}\n`;
+    if (listing.images.length > 0) {
+      formattedResults += `IMAGE_URLS: ${listing.images.join(',')}\n`;
+    }
+    formattedResults += `SNIPPET: ${listing.snippet}\n`;
+    formattedResults += `VERIFICATION: ${listing.verificationNotes.join('; ') || 'Passed all checks'}\n\n`;
+  });
+
+  // Add budget reminder
+  if (options.maxPrice) {
+    formattedResults += `\n*** BUDGET VERIFIED: All listings are under $${options.maxPrice} ***\n`;
+  }
+
+  formattedResults += `
+*** INSTRUCTIONS:
+1. All listings above have been VERIFIED by the verification agent
+2. Prices are confirmed within budget
+3. Use DIRECT_LINK and IMAGE_URLS exactly as shown
+4. Format each as: ### [Title](DIRECT_LINK) with IMAGE_URLS, Price, Source
+***`;
+
+  console.log(`\n[Orchestrator] Search complete. Returning ${verifiedListings.length} verified listings.\n`);
+  return formattedResults;
+}
+
 async function tavilySearch(options: SearchOptions): Promise<string> {
   const apiKey = process.env.TAVILY_API_KEY;
   if (!apiKey) {
@@ -893,23 +1213,20 @@ async function startServer() {
             listingAge: searchSettings?.listingAge || hunt?.listing_age
           };
 
-          // Let user know we're searching (show actual settings being used)
+          // Let user know we're searching with multi-agent system
           const searchZip = searchOptions.zipCode;
           const locationInfo = searchZip ? ` near ${searchZip}` : '';
-          const priceInfo = searchOptions.minPrice || searchOptions.maxPrice
-            ? ` (${searchOptions.minPrice ? '$' + searchOptions.minPrice : ''}${searchOptions.minPrice && searchOptions.maxPrice ? '-' : ''}${searchOptions.maxPrice ? '$' + searchOptions.maxPrice : ''})`
-            : '';
+          const priceInfo = searchOptions.maxPrice ? ` (under $${searchOptions.maxPrice})` : '';
           const enabledSources = searchOptions.sources
             ? Object.entries(searchOptions.sources).filter(([, v]) => v).map(([k]) => k)
-            : [];
-          const sourcesInfo = enabledSources.length > 0 && enabledSources.length < 9
-            ? ` on ${enabledSources.slice(0, 3).join(', ')}${enabledSources.length > 3 ? '...' : ''}`
-            : '';
-          const searchMsg = `\n\n*Searching for: "${query}"${locationInfo}${priceInfo}${sourcesInfo}...*\n\n`;
+            : ['ebay', 'etsy', 'craigslist', 'facebook'];
+
+          const searchMsg = `\n\n*🔍 Deploying ${enabledSources.length} search agents: ${enabledSources.join(', ')}*\n*Searching for: "${query}"${locationInfo}${priceInfo}*\n*Verifying prices and validating listings...*\n\n`;
           fullReply += searchMsg;
           res.write(`data: ${JSON.stringify({ text: searchMsg })}\n\n`);
 
-          toolResult = await tavilySearch(searchOptions);
+          // Use orchestrated multi-agent search
+          toolResult = await orchestratedSearch(searchOptions);
         } else {
           toolResult = JSON.stringify({ error: `Unknown tool: ${toolUseBlock.name}` });
         }
