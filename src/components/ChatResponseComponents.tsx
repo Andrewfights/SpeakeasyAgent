@@ -8,7 +8,7 @@ import { DiamondIcon, IconSearch, IconHeart, IconHeartFilled } from './ui/Icons'
 
 export interface ListingCard {
   id: string;
-  source: 'ebay' | 'etsy' | 'facebook' | 'craigslist';
+  source: 'ebay' | 'etsy' | 'facebook' | 'craigslist' | 'mercari' | '1stdibs' | 'chairish' | 'aptdeco' | 'offerup';
   title: string;
   price: number;
   score: number;
@@ -25,7 +25,7 @@ export interface CalloutBlock {
 }
 
 export interface LinkPill {
-  source: 'ebay' | 'etsy' | 'facebook' | 'craigslist' | '1stdibs';
+  source: 'ebay' | 'etsy' | 'facebook' | 'craigslist' | 'mercari' | '1stdibs' | 'chairish' | 'aptdeco' | 'offerup';
   label: string;
   url: string;
 }

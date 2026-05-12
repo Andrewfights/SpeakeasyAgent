@@ -45,32 +45,36 @@ const SYSTEM_PROMPT = `You are Speakeasy Scout, the world's most knowledgeable v
 
 1. **ALWAYS Search First**: When a user asks for items, USE the web_search tool to find REAL current listings.
 
-2. **COPY EVERYTHING EXACTLY**: Search results are formatted like:
+2. **RETURN 8-10 LISTINGS**: Always try to show at least 8-10 different items. If the first search doesn't find enough, search again with different terms.
+
+3. **COPY EVERYTHING EXACTLY**: Search results are formatted like:
    ===== LISTING 1 =====
    TITLE: Vintage Brass Lamp
    DIRECT_LINK: https://www.ebay.com/itm/123456789012
-   IMAGE_URLS: https://i.ebayimg.com/images/g/abc123.jpg,https://i.ebayimg.com/images/g/def456.jpg
+   IMAGE_URLS: https://i.ebayimg.com/images/g/abc123.jpg
    PRICE: $150
    SNIPPET: Description text...
 
-   You MUST copy the DIRECT_LINK, IMAGE_URLS, and PRICE fields EXACTLY as shown.
-   - DO NOT modify URLs in any way
-   - DO NOT make up or guess URLs
-   - DO NOT invent image URLs
-   - If no IMAGE_URLS is provided for a listing, do NOT include images
+   RULES:
+   - Copy DIRECT_LINK exactly as shown
+   - Copy IMAGE_URLS exactly as shown (if provided)
+   - Copy PRICE exactly as shown
+   - NEVER use an image URL from a different listing
+   - NEVER use image URLs from 1stdibs for an eBay listing (or any cross-source mixing)
+   - If no IMAGE_URLS is provided, skip the image line entirely - do NOT make one up
 
-3. **Format Your Response**:
+4. **Format Your Response**:
    ### [Title](DIRECT_LINK)
-   IMAGE_URLS: url1, url2, url3
+   IMAGE_URLS: url1, url2
    **Price:** $PRICE | **Source:** Site Name
    *Brief description...*
 
-   IMPORTANT: Only include the IMAGE_URLS line if IMAGE_URLS was provided in the search results. Copy ALL image URLs exactly.
+   CRITICAL: Only include IMAGE_URLS if it was provided for THAT SPECIFIC listing. Never borrow images from other listings.
 
-4. **NEVER FABRICATE**:
+5. **NEVER FABRICATE**:
    - If search returns "NO DIRECT LISTINGS FOUND", tell the user and suggest refining their search
    - Do NOT make up URLs, image URLs, or prices
-   - Only use the EXACT values from search results
+   - Do NOT mix images between listings
 
 5. **URLs Must Be ACTUAL Listing Pages**:
    VALID: https://www.ebay.com/itm/123456789012 (actual item page)
@@ -390,6 +394,7 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
       }
       console.log(`[Scout] Image domains found: ${Object.keys(imagesByDomain).join(', ')}`);
 
+      let listingsKept = 0;
       data.results.forEach((result: any, index: number) => {
         // Try to find images for this result - MUST match the listing source
         let imageUrls: string[] = [];
@@ -476,7 +481,25 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
           }
         }
 
-        formattedResults += `===== LISTING ${index + 1} =====\n`;
+        // Filter by price if max price is set
+        if (priceFromSnippet && options.maxPrice) {
+          const priceNum = parseFloat(priceFromSnippet.replace(/[$,]/g, ''));
+          if (priceNum > options.maxPrice) {
+            console.log(`[Scout] Skipping listing over max price: ${priceFromSnippet} > $${options.maxPrice}`);
+            return; // Skip this listing
+          }
+        }
+        // Filter by min price if set
+        if (priceFromSnippet && options.minPrice) {
+          const priceNum = parseFloat(priceFromSnippet.replace(/[$,]/g, ''));
+          if (priceNum < options.minPrice) {
+            console.log(`[Scout] Skipping listing under min price: ${priceFromSnippet} < $${options.minPrice}`);
+            return; // Skip this listing
+          }
+        }
+
+        listingsKept++;
+        formattedResults += `===== LISTING ${listingsKept} =====\n`;
         formattedResults += `TITLE: ${result.title}\n`;
         formattedResults += `DIRECT_LINK: ${result.url}\n`;
         if (imageUrls.length > 0) {
@@ -490,7 +513,7 @@ async function tavilySearch(options: SearchOptions): Promise<string> {
         formattedResults += `SNIPPET: ${result.content?.substring(0, 300) || 'No description'}\n\n`;
       });
 
-      console.log(`[Scout] Formatted ${data.results.length} listings with ${imagesFound} verified images`);
+      console.log(`[Scout] Formatted ${listingsKept}/${data.results.length} listings (${data.results.length - listingsKept} filtered by price) with ${imagesFound} verified images`);
 
       formattedResults += `\n*** CRITICAL INSTRUCTIONS:
 1. ONLY use the DIRECT_LINK exactly as shown - these are verified listing URLs

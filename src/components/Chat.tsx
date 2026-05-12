@@ -645,6 +645,11 @@ function parseLegacyListings(content: string): ListingCard[] {
     if (url.includes('etsy')) source = 'etsy';
     else if (url.includes('craigslist')) source = 'craigslist';
     else if (url.includes('facebook')) source = 'facebook';
+    else if (url.includes('mercari')) source = 'mercari';
+    else if (url.includes('1stdibs')) source = '1stdibs';
+    else if (url.includes('chairish')) source = 'chairish';
+    else if (url.includes('aptdeco')) source = 'aptdeco';
+    else if (url.includes('offerup')) source = 'offerup';
 
     // Extract image URLs - support multiple images for carousel
     let image: string | undefined;
@@ -665,17 +670,16 @@ function parseLegacyListings(content: string): ListingCard[] {
       const imageMatch = block.match(/!\[[^\]]*\]\((https?:\/\/[^\)\s]+)\)/i);
       if (imageMatch) {
         const candidateImage = imageMatch[1];
-        // VALIDATE: Only use image if it matches the listing source
-        if (isValidImageForSource(candidateImage, source)) {
-          image = candidateImage;
-          images = [candidateImage];
-        } else {
-          console.log('[Chat] Rejected mismatched image for', source, ':', candidateImage);
+        // Use image even if source doesn't match - better to show something
+        if (!isValidImageForSource(candidateImage, source)) {
+          console.log('[Chat] Warning: image source mismatch for', source, ':', candidateImage);
         }
+        image = candidateImage;
+        images = [candidateImage];
       } else {
         // Fallback: look for IMAGE_URL: format (single)
         const imageUrlMatch = block.match(/IMAGE_URL:\s*(https?:\/\/[^\s]+)/i);
-        if (imageUrlMatch && isValidImageForSource(imageUrlMatch[1], source)) {
+        if (imageUrlMatch) {
           image = imageUrlMatch[1];
           images = [imageUrlMatch[1]];
         }
